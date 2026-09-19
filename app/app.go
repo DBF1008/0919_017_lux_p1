@@ -30,8 +30,8 @@ func init() {
 		fmt.Fprintf(
 			color.Output,
 			"\n%s: version %s, A fast and simple video downloader.\n\n",
-			cyan.Sprintf(Name),
-			blue.Sprintf(c.App.Version),
+			cyan.Sprint(Name),
+			blue.Sprint(c.App.Version),
 		)
 	}
 }

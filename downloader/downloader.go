@@ -58,6 +58,11 @@ const (
 	DOWNLOAD_FILE_EXT = ".download"
 )
 
+// multiThreadTimeout is the maximum duration multiThreadSave waits for all
+// part download goroutines to finish before giving up. It is a variable so
+// that tests can adjust it.
+var multiThreadTimeout = 30 * time.Minute
+
 func progressBar(size int64) *pb.ProgressBar {
 	tmpl := `{{counters .}} {{bar . "[" "=" ">" "-" "]"}} {{speed .}} {{percent . | green}} {{rtime .}}`
 	return pb.New64(size).
@@ -340,20 +345,24 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 	wgp := utils.NewWaitGroupPool(downloader.option.ThreadNumber)
 	var errs []error
 	var mu sync.Mutex
+	appendErr := func(err error) {
+		mu.Lock()
+		errs = append(errs, err)
+		mu.Unlock()
+	}
+	// cancel is closed when the download times out, signaling all part
+	// download goroutines to abort so they don't leak.
+	cancel := make(chan struct{})
 	for _, part := range unfinishedPart {
 		wgp.Add()
 		go func(part *FilePartMeta) {
+			defer wgp.Done()
 			file, err := os.OpenFile(filePartPath(filePath, part), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
 			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
+				appendErr(err)
 				return
 			}
-			defer func() {
-				file.Close() // nolint
-				wgp.Done()
-			}()
+			defer file.Close() // nolint
 
 			var end, chunkSize int64
 			headers := map[string]string{
@@ -369,13 +378,16 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 				// Only write part to new file.
 				err = writeFilePartMeta(file, part)
 				if err != nil {
-					mu.Lock()
-					errs = append(errs, err)
-					mu.Unlock()
+					appendErr(err)
 					return
 				}
 			}
 			for remainingSize > 0 {
+				select {
+				case <-cancel:
+					return
+				default:
+				}
 				end = computeEnd(part.Cur, chunkSize, part.End)
 				headers["Range"] = fmt.Sprintf("bytes=%d-%d", part.Cur, end)
 				temp := part.Cur
@@ -385,9 +397,7 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 						remainingSize -= chunkSize
 						break
 					} else if i+1 >= downloader.option.RetryTimes {
-						mu.Lock()
-						errs = append(errs, err)
-						mu.Unlock()
+						appendErr(err)
 						return
 					}
 					temp += written
@@ -397,7 +407,17 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 			}
 		}(part)
 	}
-	wgp.Wait()
+	done := make(chan struct{})
+	go func() {
+		wgp.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(multiThreadTimeout):
+		close(cancel)
+		return errors.Errorf("multi-thread download of %s timed out after %s", fileName, multiThreadTimeout)
+	}
 	if len(errs) > 0 {
 		return errs[0]
 	}
@@ -482,7 +502,17 @@ func mergeMultiPart(filepath string, parts []*FilePartMeta) error {
 	}
 	var partFiles []*os.File
 	defer func() {
+		// Ensure the temp file is closed on error paths; the explicit Close
+		// before the rename below is the success path, a second Close here
+		// is harmless.
+		tempFile.Close() // nolint
 		for _, f := range partFiles {
+			if f == nil {
+				continue
+			}
+			// The part file may have already been removed externally,
+			// ignore close/remove errors to avoid panics or masking the
+			// real error.
 			f.Close()           // nolint
 			os.Remove(f.Name()) // nolint
 		}
@@ -689,9 +719,14 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 	// multiple fragments
 	errs := make([]error, 0)
 	lock := sync.Mutex{}
+	hasErr := func() bool {
+		lock.Lock()
+		defer lock.Unlock()
+		return len(errs) > 0
+	}
 	parts := make([]string, len(stream.Parts))
 	for index, part := range stream.Parts {
-		if len(errs) > 0 {
+		if hasErr() {
 			break
 		}
 
@@ -723,7 +758,7 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 		}(part, partFileName)
 	}
 	wgp.Wait()
-	if len(errs) > 0 {
+	if hasErr() {
 		return errs[0]
 	}
 	downloader.Bar.Finish()

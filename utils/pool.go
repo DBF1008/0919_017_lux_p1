@@ -25,8 +25,8 @@ func NewWaitGroupPool(size int) *WaitGroupPool {
 // Add increments the WaitGroup counter by one.
 // See sync.WaitGroup documentation for more information.
 func (p *WaitGroupPool) Add() {
-	p.pool <- struct{}{}
 	p.wg.Add(1)
+	p.pool <- struct{}{}
 }
 
 // Done decrements the WaitGroup counter by one.

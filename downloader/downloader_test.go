@@ -1,10 +1,72 @@
 package downloader
 
 import (
+	"bytes"
+	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/iawia002/lux/extractors"
 )
+
+func writeTestPartFile(t *testing.T, filePath string, part *FilePartMeta, data []byte) {
+	t.Helper()
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close() // nolint
+	if err := binary.Write(file, binary.LittleEndian, part); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMergeMultiPart(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "test.mp4")
+	parts := []*FilePartMeta{
+		{Index: 0, Start: 0, End: 4, Cur: 5},
+		{Index: 1, Start: 5, End: 9, Cur: 10},
+	}
+	writeTestPartFile(t, filePartPath(filePath, parts[0]), parts[0], []byte("hello"))
+	writeTestPartFile(t, filePartPath(filePath, parts[1]), parts[1], []byte("world"))
+
+	if err := mergeMultiPart(filePath, parts); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(merged, []byte("helloworld")) {
+		t.Fatalf("unexpected merged content: %q", merged)
+	}
+	// part files should be cleaned up after merging
+	for _, part := range parts {
+		if _, err := os.Stat(filePartPath(filePath, part)); !os.IsNotExist(err) {
+			t.Fatalf("part file %s should have been removed", filePartPath(filePath, part))
+		}
+	}
+}
+
+func TestMergeMultiPartMissingPartFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "test.mp4")
+	parts := []*FilePartMeta{
+		{Index: 0, Start: 0, End: 4, Cur: 5},
+		{Index: 1, Start: 5, End: 9, Cur: 10},
+	}
+	writeTestPartFile(t, filePartPath(filePath, parts[0]), parts[0], []byte("hello"))
+	// parts[1] has no corresponding file, mergeMultiPart should return an
+	// error instead of panicking.
+	if err := mergeMultiPart(filePath, parts); err == nil {
+		t.Fatal("expected an error for missing part file, got nil")
+	}
+}
 
 func TestDownload(t *testing.T) {
 	testCases := []struct {
