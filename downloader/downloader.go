@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -41,6 +42,9 @@ type Options struct {
 	ThreadNumber int
 	RetryTimes   int
 	ChunkSizeMB  int
+	// MultiThreadTimeout is the maximum duration of one multi-thread
+	// download, defaults to DefaultMultiThreadTimeout if not positive.
+	MultiThreadTimeout time.Duration
 	// Aria2
 	UseAria2RPC bool
 	Aria2Token  string
@@ -56,6 +60,9 @@ type Downloader struct {
 
 const (
 	DOWNLOAD_FILE_EXT = ".download"
+
+	// DefaultMultiThreadTimeout is the default timeout of multiThreadSave.
+	DefaultMultiThreadTimeout = 10 * time.Minute
 )
 
 func progressBar(size int64) *pb.ProgressBar {
@@ -108,8 +115,10 @@ func (downloader *Downloader) caption(url, fileName, ext string, transform func(
 	return nil
 }
 
-func (downloader *Downloader) writeFile(url string, file *os.File, headers map[string]string) (int64, error) {
-	res, err := request.Request(http.MethodGet, url, nil, headers)
+func (downloader *Downloader) writeFile(
+	ctx context.Context, url string, file *os.File, headers map[string]string,
+) (int64, error) {
+	res, err := request.RequestWithContext(ctx, http.MethodGet, url, nil, headers)
 	if err != nil {
 		return 0, err
 	}
@@ -193,7 +202,7 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 			headers["Range"] = fmt.Sprintf("bytes=%d-%d", start, end)
 			temp := start
 			for i := 0; ; i++ {
-				written, err := downloader.writeFile(part.URL, file, headers)
+				written, err := downloader.writeFile(context.Background(), part.URL, file, headers)
 				if err == nil {
 					break
 				} else if i+1 >= downloader.option.RetryTimes {
@@ -208,7 +217,7 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 	} else {
 		temp := tempFileSize
 		for i := 0; ; i++ {
-			written, err := downloader.writeFile(part.URL, file, headers)
+			written, err := downloader.writeFile(context.Background(), part.URL, file, headers)
 			if err == nil {
 				break
 			} else if i+1 >= downloader.option.RetryTimes {
@@ -337,23 +346,41 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 		}
 	}
 
+	// Bound the whole multi-thread download with a timeout and propagate
+	// cancellation to every goroutine so none of them leaks.
+	timeout := downloader.option.MultiThreadTimeout
+	if timeout <= 0 {
+		timeout = DefaultMultiThreadTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	wgp := utils.NewWaitGroupPool(downloader.option.ThreadNumber)
-	var errs []error
-	var mu sync.Mutex
+	var (
+		errs   []error
+		errsMu sync.Mutex
+	)
+	// appendErr records a goroutine error and cancels the remaining
+	// downloads so the other goroutines can exit as soon as possible.
+	appendErr := func(err error) {
+		errsMu.Lock()
+		errs = append(errs, err)
+		errsMu.Unlock()
+		cancel()
+	}
 	for _, part := range unfinishedPart {
 		wgp.Add()
 		go func(part *FilePartMeta) {
+			// Done must be deferred before any other return path,
+			// otherwise Wait blocks forever when a goroutine fails early.
+			defer wgp.Done()
+
 			file, err := os.OpenFile(filePartPath(filePath, part), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
 			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
+				appendErr(err)
 				return
 			}
-			defer func() {
-				file.Close() // nolint
-				wgp.Done()
-			}()
+			defer file.Close() // nolint
 
 			var end, chunkSize int64
 			headers := map[string]string{
@@ -367,27 +394,26 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 			remainingSize := part.End - part.Cur + 1
 			if part.Cur == part.Start {
 				// Only write part to new file.
-				err = writeFilePartMeta(file, part)
-				if err != nil {
-					mu.Lock()
-					errs = append(errs, err)
-					mu.Unlock()
+				if err = writeFilePartMeta(file, part); err != nil {
+					appendErr(err)
 					return
 				}
 			}
 			for remainingSize > 0 {
+				if err = ctx.Err(); err != nil {
+					appendErr(err)
+					return
+				}
 				end = computeEnd(part.Cur, chunkSize, part.End)
 				headers["Range"] = fmt.Sprintf("bytes=%d-%d", part.Cur, end)
 				temp := part.Cur
 				for i := 0; ; i++ {
-					written, err := downloader.writeFile(dataPart.URL, file, headers)
+					written, err := downloader.writeFile(ctx, dataPart.URL, file, headers)
 					if err == nil {
 						remainingSize -= chunkSize
 						break
-					} else if i+1 >= downloader.option.RetryTimes {
-						mu.Lock()
-						errs = append(errs, err)
-						mu.Unlock()
+					} else if i+1 >= downloader.option.RetryTimes || ctx.Err() != nil {
+						appendErr(err)
 						return
 					}
 					temp += written
@@ -398,6 +424,8 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 		}(part)
 	}
 	wgp.Wait()
+	errsMu.Lock()
+	defer errsMu.Unlock()
 	if len(errs) > 0 {
 		return errs[0]
 	}
@@ -480,31 +508,40 @@ func mergeMultiPart(filepath string, parts []*FilePartMeta) error {
 	if err != nil {
 		return err
 	}
-	var partFiles []*os.File
-	defer func() {
-		for _, f := range partFiles {
-			f.Close()           // nolint
-			os.Remove(f.Name()) // nolint
-		}
-	}()
+	// Always close the temp file; the explicit Close before the rename is
+	// what matters, this deferred call is only a safety net for the error
+	// paths and its error can be ignored.
+	defer tempFile.Close() // nolint
 	for _, part := range parts {
-		file, err := os.Open(filePartPath(filepath, part))
+		partPath := filePartPath(filepath, part)
+		file, err := os.Open(partPath)
 		if err != nil {
 			return err
 		}
-		partFiles = append(partFiles, file)
-		_, err = file.Seek(int64(binary.Size(part)), 0)
-		if err != nil {
-			return err
+		// Close each part file right after it has been merged instead of
+		// deferring everything, so the file handles are not accumulated
+		// and every file is closed exactly once before it is removed.
+		_, seekErr := file.Seek(int64(binary.Size(part)), 0)
+		if seekErr == nil {
+			_, seekErr = io.Copy(tempFile, file)
 		}
-		_, err = io.Copy(tempFile, file)
-		if err != nil {
+		closeErr := file.Close()
+		if seekErr != nil {
+			return seekErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		// Remove the part file only after it has been fully merged and
+		// closed; a file that is already gone is not an error.
+		if err := os.Remove(partPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
-	tempFile.Close() // nolint
-	err = os.Rename(tempFilePath, filepath)
-	return err
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempFilePath, filepath)
 }
 
 func (downloader *Downloader) aria2(title string, stream *extractors.Stream) error {
@@ -687,11 +724,25 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 
 	wgp := utils.NewWaitGroupPool(downloader.option.ThreadNumber)
 	// multiple fragments
-	errs := make([]error, 0)
-	lock := sync.Mutex{}
+	var (
+		errs   []error
+		errsMu sync.Mutex
+	)
+	// errs must only be accessed through these helpers, the goroutines
+	// below append to it concurrently with the loop reading it.
+	appendErr := func(err error) {
+		errsMu.Lock()
+		errs = append(errs, err)
+		errsMu.Unlock()
+	}
+	hasErr := func() bool {
+		errsMu.Lock()
+		defer errsMu.Unlock()
+		return len(errs) > 0
+	}
 	parts := make([]string, len(stream.Parts))
 	for index, part := range stream.Parts {
-		if len(errs) > 0 {
+		if hasErr() {
 			break
 		}
 
@@ -716,14 +767,13 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 				err = downloader.save(part, data.URL, fileName)
 			}
 			if err != nil {
-				lock.Lock()
-				errs = append(errs, err)
-				lock.Unlock()
+				appendErr(err)
 			}
 		}(part, partFileName)
 	}
 	wgp.Wait()
-	if len(errs) > 0 {
+	// All goroutines have finished after Wait, so errs can be read safely.
+	if hasErr() {
 		return errs[0]
 	}
 	downloader.Bar.Finish()

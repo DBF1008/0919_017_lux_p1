@@ -3,6 +3,7 @@ package request
 import (
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -47,8 +48,16 @@ func SetOptions(opt Options) {
 	debug = opt.Debug
 }
 
-// Request base request
+// Request base request.
 func Request(method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
+	return RequestWithContext(context.Background(), method, url, body, headers)
+}
+
+// RequestWithContext is like Request but the request is canceled when the
+// given context is done.
+func RequestWithContext(
+	ctx context.Context, method, url string, body io.Reader, headers map[string]string,
+) (*http.Response, error) {
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		DisableCompression:  true,
@@ -65,7 +74,7 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		Jar:       jar,
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

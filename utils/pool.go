@@ -25,15 +25,19 @@ func NewWaitGroupPool(size int) *WaitGroupPool {
 // Add increments the WaitGroup counter by one.
 // See sync.WaitGroup documentation for more information.
 func (p *WaitGroupPool) Add() {
-	p.pool <- struct{}{}
+	// The WaitGroup counter must be incremented before blocking on the
+	// pool, otherwise Wait may return while a goroutine is still waiting
+	// to enter the pool, and a later Add would panic with
+	// "sync: WaitGroup is reused before previous Wait has returned".
 	p.wg.Add(1)
+	p.pool <- struct{}{}
 }
 
 // Done decrements the WaitGroup counter by one.
 // See sync.WaitGroup documentation for more information.
 func (p *WaitGroupPool) Done() {
-	<-p.pool
 	p.wg.Done()
+	<-p.pool
 }
 
 // Wait blocks until the WaitGroup counter is zero.
